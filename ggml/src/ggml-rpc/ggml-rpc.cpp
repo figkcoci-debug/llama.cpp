@@ -1340,6 +1340,22 @@ public:
     };
 
 private:
+    // Per-tensor backend state ("extra"), kept on the server side.
+    //
+    // Tensors arriving over RPC are rebuilt from the wire for every request (see
+    // deserialize_tensor), so anything a backend writes into tensor->extra is lost
+    // as soon as the request ends. Most backends do not care; OpenCL does. There,
+    // extra is the cl_mem plus byte offset that every one of its kernels reads, and
+    // set_tensor even *replaces* extra with a repacked (SoA) variant that the matmul
+    // kernels later require - losing it breaks both uploads and compute. The device
+    // pointer in tensor->data is stable across requests, so that is the key we file
+    // the state under.
+    void restore_tensor_extra(ggml_tensor * tensor, bool create_if_missing);
+    void remember_tensor_extra(const ggml_tensor * tensor);
+    void forget_tensor_extras(ggml_backend_buffer_t buffer);
+
+    std::unordered_map<uint64_t, void *> tensor_extras;
+
     void sync_all_backends();
     bool get_cached_file(uint64_t hash, std::vector<uint8_t> & data);
     ggml_tensor * deserialize_tensor(struct ggml_context * ctx, const rpc_tensor * tensor);
@@ -1487,6 +1503,9 @@ bool rpc_server::free_buffer(const rpc_msg_free_buffer_req & request) {
             sg.second.graph = nullptr;
         }
     }
+    // Drop the state filed for this buffer's tensors before the buffer, and with
+    // it the backend's own storage for that state, goes away.
+    forget_tensor_extras(buffer);
     ggml_backend_buffer_free(buffer);
     buffers.erase(buffer);
     return true;
@@ -1547,8 +1566,48 @@ bool rpc_server::memset_tensor(const rpc_msg_memset_tensor_req & request) {
 
     LOG_DBG("[%s] buffer: %p, data: %p, offset: %" PRIu64 ", size: %" PRIu64 ", value: %u\n",
             __func__, (void *) tensor->buffer, tensor->data, request.offset, request.size, request.value);
+    restore_tensor_extra(tensor, true);
     ggml_backend_tensor_memset(tensor, request.value, request.offset, request.size);
     return true;
+}
+
+// See the comment on tensor_extras in the class declaration.
+void rpc_server::remember_tensor_extra(const ggml_tensor * tensor) {
+    if (tensor->extra != nullptr && tensor->data != nullptr) {
+        tensor_extras[(uint64_t) tensor->data] = tensor->extra;
+    }
+}
+
+void rpc_server::restore_tensor_extra(ggml_tensor * tensor, bool create_if_missing) {
+    if (tensor->buffer == nullptr || tensor->data == nullptr ||
+        tensor->buffer->iface.init_tensor == nullptr) {
+        return;
+    }
+
+    auto it = tensor_extras.find((uint64_t) tensor->data);
+    if (it != tensor_extras.end()) {
+        tensor->extra = it->second;
+        return;
+    }
+
+    if (!create_if_missing || tensor->view_src != nullptr) {
+        // A view borrows the state of the tensor it was taken from and applies the
+        // difference through view_offs at kernel time, so building a separate one
+        // here would double-count the displacement. A tensor the client has not
+        // written to yet has no state worth building.
+        return;
+    }
+
+    tensor->buffer->iface.init_tensor(tensor->buffer, tensor);
+    remember_tensor_extra(tensor);
+}
+
+void rpc_server::forget_tensor_extras(ggml_backend_buffer_t buffer) {
+    const uint64_t lo = (uint64_t) ggml_backend_buffer_get_base(buffer);
+    const uint64_t hi = lo + ggml_backend_buffer_get_size(buffer);
+    for (auto it = tensor_extras.begin(); it != tensor_extras.end(); ) {
+        it = (it->first >= lo && it->first < hi) ? tensor_extras.erase(it) : std::next(it);
+    }
 }
 
 ggml_tensor * rpc_server::deserialize_tensor(struct ggml_context * ctx, const rpc_tensor * tensor) {
@@ -1660,7 +1719,11 @@ bool rpc_server::set_tensor(const std::vector<uint8_t> & input) {
         ofs.write((const char *)data, size);
         GGML_LOG_INFO("[%s] saved to '%s'\n", __func__, cache_file.string().c_str());
     }
+    restore_tensor_extra(tensor, true);
     ggml_backend_tensor_set(tensor, data, offset, size);
+    // This is where OpenCL repacks a quantized tensor into its SoA layout and
+    // swaps in a replacement extra, so pick up whatever it left behind.
+    remember_tensor_extra(tensor);
     return true;
 }
 
@@ -1721,7 +1784,9 @@ bool rpc_server::set_tensor_2d(const std::vector<uint8_t> & input) {
     }
 
     const void * data = input.data() + sizeof(rpc_tensor) + 4*sizeof(uint64_t);
+    restore_tensor_extra(tensor, true);
     ggml_backend_tensor_set_2d(tensor, data, offset, size, n_copies, stride, size);
+    remember_tensor_extra(tensor);
     return true;
 }
 
@@ -1783,7 +1848,9 @@ bool rpc_server::set_tensor_hash(const rpc_msg_set_tensor_hash_req & request, rp
             return false;
         }
     }
+    restore_tensor_extra(tensor, true);
     ggml_backend_tensor_set(tensor, cached_file.data(), request.offset, size);
+    remember_tensor_extra(tensor);
     response.result = 1;
     return true;
 }
@@ -1804,21 +1871,22 @@ bool rpc_server::init_tensor(const rpc_msg_init_tensor_req & request) {
         return false;
     }
     LOG_DBG("[%s] buffer: %p, data: %p\n", __func__, (void*)tensor->buffer, tensor->data);
-    // Call the backend's buffer_init_tensor function
+    // Call the backend's buffer_init_tensor function.
+    //
+    // The tensor object here is transient (see tensor_extras), so whatever the
+    // backend builds has to be filed away for the requests that follow. The state
+    // stays server-side on purpose: it describes device memory the client has no
+    // business knowing about, and it is keyed by a pointer the client already has.
     ggml_backend_buffer_t buffer = tensor->buffer;
     if (buffer && buffer->iface.init_tensor) {
-        buffer->iface.init_tensor(buffer, tensor);
+        if (tensor->data != nullptr && tensor_extras.find((uint64_t) tensor->data) == tensor_extras.end()) {
+            buffer->iface.init_tensor(buffer, tensor);
+            remember_tensor_extra(tensor);
+        }
     } else {
         if (!buffer) {
             GGML_LOG_ERROR("Tensor with null buffer passed to init_tensor function\n");
         }
-    }
-
-    if (tensor->extra != nullptr) {
-        // This pointer can either be passed around client/server, or probably better stored server-side and kept track of.
-        // Currently unimplemented.
-        GGML_LOG_ERROR("tensor->extra populated by the backend, this is currently unsupported.\n");
-        return false;
     }
 
     return true;
@@ -1856,6 +1924,7 @@ bool rpc_server::get_tensor(const rpc_msg_get_tensor_req & request, std::vector<
     }
 
     response.resize(request.size, 0);
+    restore_tensor_extra(tensor, true);
     ggml_backend_tensor_get(tensor, response.data(), request.offset, request.size);
     return true;
 }
@@ -1904,6 +1973,7 @@ bool rpc_server::get_tensor_2d(const rpc_msg_get_tensor_2d_req & request, std::v
     }
 
     response.resize(request.size * request.n_copies, 0);
+    restore_tensor_extra(tensor, true);
     ggml_backend_tensor_get_2d(tensor, response.data(), request.offset, request.size, request.n_copies, request.stride, request.size);
     return true;
 }
@@ -1946,7 +2016,10 @@ bool rpc_server::copy_tensor(const rpc_msg_copy_tensor_req & request, rpc_msg_co
     LOG_DBG("[%s] src->buffer: %p, dst->buffer: %p\n",
             __func__, (void*) src->buffer, (void*) dst->buffer);
 
+    restore_tensor_extra(src, true);
+    restore_tensor_extra(dst, true);
     response.result = ggml_backend_buffer_copy_tensor(src, dst);
+    remember_tensor_extra(dst);
     return true;
 }
 
@@ -2003,6 +2076,13 @@ ggml_tensor * rpc_server::create_node(uint64_t id,
         }
     }
     result->view_offs = tensor->view_offs;
+    if (result->view_src != nullptr) {
+        // Borrow the state of the tensor this one was taken from: the kernels add
+        // view_offs to that offset, so a separate extra would double-count it.
+        result->extra = result->view_src->extra;
+    } else {
+        restore_tensor_extra(result, true);
+    }
     return result;
 }
 

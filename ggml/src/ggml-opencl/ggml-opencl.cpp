@@ -450,6 +450,10 @@ static void ggml_cl_adreno_xmem_attn_release_scratch(ggml_backend_opencl_context
 #endif
 
 // backend device context
+// Up to this many tokens in flight, the small elementwise ops are left to the CPU.
+// See the comment on ggml_opencl_op_is_small_elementwise.
+#define GGML_OPENCL_SMALL_OPS_MAX_TOKENS_DEFAULT 4
+
 struct ggml_backend_opencl_device_context {
     cl_platform_id platform;
     std::string platform_name;
@@ -472,6 +476,7 @@ struct ggml_backend_opencl_device_context {
 
     std::regex *opfilter = nullptr; // regex of ops to not claim
     std::string opfilter_str = ""; // regex string for opfilter
+    int small_ops_max_tokens = GGML_OPENCL_SMALL_OPS_MAX_TOKENS_DEFAULT;
     size_t global_mem_size = 0;
 };
 
@@ -6642,6 +6647,16 @@ static bool ggml_opencl_is_device_supported(ggml_backend_dev_t dev) {
         dev_ctx->opfilter = new std::regex(str_opfilter, std::regex_constants::icase);
     }
 
+    const char * str_small_ops = getenv("GGML_OPENCL_SMALL_OPS_MAX_TOKENS");
+    if (str_small_ops) {
+        dev_ctx->small_ops_max_tokens = atoi(str_small_ops);
+    }
+    if (dev_ctx->small_ops_max_tokens > 0) {
+        GGML_LOG_INFO("ggml_opencl: NORM, RMS_NORM, ADD, MUL, SILU and ROPE stay on the CPU "
+                      "while at most %d tokens are in flight (GGML_OPENCL_SMALL_OPS_MAX_TOKENS)\n",
+                      dev_ctx->small_ops_max_tokens);
+    }
+
     return true;
 }
 
@@ -8834,12 +8849,56 @@ inline bool use_q5_k_bin_kernels(const ggml_backend_opencl_context *backend_ctx,
 #endif
 }
 
+// The ops below are cheap in arithmetic and expensive in dispatch. Measured on an
+// Adreno 740 (ROG Phone 7): each of them costs on the order of 7 ms of graph time
+// however little work it holds, which is the same order as the matmuls it sits next
+// to. A decode step runs about a hundred and fifty of them, and the CPU does that
+// arithmetic in tens of milliseconds, so for a single token the CPU wins by a wide
+// margin. A prompt of a few hundred tokens is a different story: there the GPU's
+// throughput wins, and forcing these ops off it roughly halves prompt processing
+// (measured: 0.5B pp32 17.13 -> 7.69 t/s, 3B pp32 9.88 -> 4.98 t/s). Hence the rule
+// is conditional on how many tokens are in flight.
+static bool ggml_opencl_op_is_small_elementwise(const struct ggml_tensor * op) {
+    switch (op->op) {
+        case GGML_OP_NORM:
+        case GGML_OP_RMS_NORM:
+        case GGML_OP_ADD:
+        case GGML_OP_MUL:
+        case GGML_OP_ROPE:
+            return true;
+        case GGML_OP_UNARY:
+            // ggml_op_desc() names these by their unary op, so a filter written
+            // against the op names matches "SILU" here rather than GGML_OP_SILU.
+            return ggml_get_unary_op(op) == GGML_UNARY_OP_SILU;
+        default:
+            return false;
+    }
+}
+
+// How many tokens the op is working on. Every op above but ROPE holds its tokens in
+// the dimensions past ne[0]; ROPE is handed a 3D view of the heads (build_qkv in
+// llama-graph.cpp) whose ne[1] is n_head, so its tokens sit one dimension further in.
+static int64_t ggml_opencl_op_token_count(const struct ggml_tensor * op) {
+    const struct ggml_tensor * src0 = op->src[0];
+    if (src0 == nullptr) {
+        return 0;
+    }
+    return op->op == GGML_OP_ROPE ? src0->ne[2] : ggml_nrows(src0);
+}
+
 static bool ggml_opencl_supports_op(ggml_backend_dev_t dev, const struct ggml_tensor * op) {
     ggml_backend_opencl_device_context * dev_ctx     = (ggml_backend_opencl_device_context *)dev->context;
     ggml_backend_opencl_context *        backend_ctx = dev_ctx->backend_ctx;
 
     // reject ops that match the opfilter regex
     if (dev_ctx->opfilter && std::regex_match(std::string(ggml_op_desc(op)), *dev_ctx->opfilter)) {
+        return false;
+    }
+
+    // Hand the small elementwise ops to the CPU while only a few tokens are in
+    // flight. See the comment on ggml_opencl_op_is_small_elementwise.
+    if (dev_ctx->small_ops_max_tokens > 0 && ggml_opencl_op_is_small_elementwise(op) &&
+        ggml_opencl_op_token_count(op) <= dev_ctx->small_ops_max_tokens) {
         return false;
     }
 
