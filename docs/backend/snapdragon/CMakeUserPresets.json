@@ -24,6 +24,7 @@
             "GGML_LLAMAFILE":   "OFF",
             "GGML_OPENCL":      "ON",
             "GGML_HEXAGON":     "ON",
+            "GGML_RPC":         "ON",
             "LLAMA_OPENSSL":    "OFF"
         }
     },
