@@ -137,6 +137,70 @@ FLOAT_TYPE mul_q8_1(const int32_t q_sum, const float da, const vec2 dsb, const i
 }
 #endif
 
+#if defined(DATA_A_TQ1_0)
+// TQ1_0, 5 trits per byte along 32 bytes plus 4 trits per qh byte, 256 elements per block
+FLOAT_TYPE get_dm(uint ib) {
+    return FLOAT_TYPE(data_a[ib / 8].d);
+}
+
+// Packs the 4 trits of elements word*4..word*4+3 of the q8_1 chunk ib into one int32 word.
+// Byte m carries the elements m, m+32, m+64, m+96, m+128, so a word of 4 consecutive
+// elements maps to 4 consecutive qs bytes at one digit position (or to the qh bytes).
+int32_t repack_tq1_0(uint ib, uint word) {
+    const uint ibk = ib / 8;
+    const uint c = ib % 8;
+    const uint w = word;
+
+    uint base;
+    uint digit;
+    bool qh = false;
+    if (c < 5u) {
+        base = w * 4u;
+        digit = c;
+    } else if (c < 7u) {
+        base = 32u + (w & 3u) * 4u;
+        digit = (c - 5u) * 2u + (w >> 2u);
+    } else if (w < 4u) {
+        base = 32u + w * 4u;
+        digit = 4u;
+    } else {
+        qh = true;
+        base = 0u;
+        digit = w - 4u;
+    }
+
+    const u8vec4 b = qh
+        ? u8vec4(data_a[ibk].qh[0], data_a[ibk].qh[1], data_a[ibk].qh[2], data_a[ibk].qh[3])
+        : u8vec4(data_a[ibk].qs[base], data_a[ibk].qs[base + 1u], data_a[ibk].qs[base + 2u], data_a[ibk].qs[base + 3u]);
+
+    // Same trick as the NEON reference. Multiply the byte by 3^digit with 8-bit wrap
+    // then round(3*q/256) recovers the stored trit 0..2.
+    const uint POW3_PACKED = (1u << 28) | (3u << 21) | (9u << 14) | (27u << 7) | 81u;
+    const uint p3 = (POW3_PACKED >> (7u * (4u - digit))) & 0x7Fu;
+    const uvec4 q = uvec4(b) * uvec4(p3);
+    const uvec4 trit = ((q & 0xFFu) * 3u) >> 8u;
+    return int32_t(trit.x | (trit.y << 8u) | (trit.z << 16u) | (trit.w << 24u));
+}
+
+FLOAT_TYPE mul_q8_1(const int32_t q_sum, const float da, const vec2 dsb, const int32_t sum_divisor) {
+    return FLOAT_TYPE(da * (float(q_sum) * dsb.x - dsb.y / float(sum_divisor)));
+}
+
+FLOAT_TYPE mmvq_dot_product(const uint ib_a, const uint iqs) {
+    // TQ1_0 counts as a K quant (DATA_A_QUANT_K), so K_PER_ITER is 16 and this
+    // thread walks words iqs*4 .. iqs*4+3 of the q8_1 chunk
+    int32_t q_sum = 0;
+    q_sum += dotPacked4x8EXT(repack_tq1_0(ib_a, iqs * 4u),     cache_b_qs[0]);
+    q_sum += dotPacked4x8EXT(repack_tq1_0(ib_a, iqs * 4u + 1u), cache_b_qs[1]);
+    q_sum += dotPacked4x8EXT(repack_tq1_0(ib_a, iqs * 4u + 2u), cache_b_qs[2]);
+    q_sum += dotPacked4x8EXT(repack_tq1_0(ib_a, iqs * 4u + 3u), cache_b_qs[3]);
+
+    // The packed trits hold trit = weight + 1. This thread covers 16 of the 32
+    // elements of the q8_1 block, so the activation sum correction halves
+    return mul_q8_1(q_sum, get_dm(ib_a), cache_b_ds, 2);
+}
+#endif
+
 #if defined(DATA_A_MXFP4)
 // 1-byte loads for mxfp4 blocks (17 bytes)
 i32vec2 repack(uint ib, uint iqs) {
