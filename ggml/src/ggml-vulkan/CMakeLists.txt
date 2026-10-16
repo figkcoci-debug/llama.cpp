@@ -122,6 +122,13 @@ if (Vulkan_FOUND)
     target_link_libraries(ggml-vulkan PRIVATE Vulkan::Vulkan)
     target_include_directories(ggml-vulkan PRIVATE ${CMAKE_CURRENT_BINARY_DIR})
 
+    # Fix (kruko, branch feature/vulkan-tq1): the Vulkan-Hpp bindings (vulkan/vulkan.hpp)
+    # live in the Vulkan SDK, the Android NDK sysroot only carries the C headers. Without
+    # this, cross builds fail on ggml-vulkan-types.h with 'vulkan/vulkan.hpp' file not found.
+    if (DEFINED ENV{VULKAN_SDK})
+        target_include_directories(ggml-vulkan PRIVATE "$ENV{VULKAN_SDK}/Include")
+    endif()
+
     # Workaround to the "can't dereference invalidated vector iterator" bug in clang-cl debug build
     # Possibly relevant: https://stackoverflow.com/questions/74748276/visual-studio-no-displays-the-correct-length-of-stdvector
     if (MSVC AND CMAKE_CXX_COMPILER_ID STREQUAL "Clang")
