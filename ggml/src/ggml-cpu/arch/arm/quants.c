@@ -1680,7 +1680,138 @@ void ggml_vec_dot_ptq1_0_q8_0(int n, float * GGML_RESTRICT s, size_t bs, const v
 #endif
 }
 
+#if defined(__ARM_NEON)
+// [krukoai:tq1-2x2] Decode one TQ1_0 block into 16 int8 vectors, in the same order
+// as the vdot loops below. Keeping the decode in one place lets the 2x2 path reuse
+// the exact packing rules of the 1-row path.
+static inline void ggml_tq1_decode_block(
+        const block_tq1_0 * GGML_RESTRICT x,
+        int8x16_t q[16]) {
+    static const uint8_t mul[5] = { 1, 3, 9, 27, 81 };
+    static const uint8_t k_shift[16] = { 1, 1, 1, 1, 3, 3, 3, 3, 9, 9, 9, 9, 27, 27, 27, 27 };
+    const uint8x16_t shift = vld1q_u8(k_shift);
+
+    for (int j = 0; j < 2; ++j) {
+        const uint8x16_t v = vld1q_u8(x->qs + j*16);
+        for (int k = 0; k < 5; ++k) {
+            const uint8x16_t qx = vmulq_u8(v, vdupq_n_u8(mul[k]));
+            q[k*2 + j] = vreinterpretq_s8_u8(
+                vshrq_n_u8(vhaddq_u8(qx, vshrq_n_u8(qx, 1)), 6));
+        }
+    }
+
+    {
+        const uint8x16_t v = vld1q_u8(x->qs + 32);
+        for (int k = 0; k < 5; ++k) {
+            const uint8x16_t qx = vmulq_u8(v, vdupq_n_u8(mul[k]));
+            q[10 + k] = vreinterpretq_s8_u8(
+                vshrq_n_u8(vhaddq_u8(qx, vshrq_n_u8(qx, 1)), 6));
+        }
+    }
+
+    {
+        uint32_t qh;
+        memcpy(&qh, x->qh, sizeof(qh));
+        uint8x16_t qx = vreinterpretq_u8_u32(vdupq_n_u32(qh));
+        qx = vmulq_u8(qx, shift);
+        q[15] = vreinterpretq_s8_u8(
+            vshrq_n_u8(vhaddq_u8(qx, vshrq_n_u8(qx, 1)), 6));
+    }
+}
+#endif
+
+#if defined(__ARM_NEON) && defined(__ARM_FEATURE_DOTPROD)
+// [krukoai:tq1-2x2] two weight rows x two activation rows, TQ1_0 x Q8_K.
+static inline void ggml_tq1_dot_2x2(
+        const block_tq1_0 * GGML_RESTRICT x0,
+        const block_tq1_0 * GGML_RESTRICT x1,
+        const block_q8_K  * GGML_RESTRICT y0,
+        const block_q8_K  * GGML_RESTRICT y1,
+        int32_t * GGML_RESTRICT s00,
+        int32_t * GGML_RESTRICT s01,
+        int32_t * GGML_RESTRICT s10,
+        int32_t * GGML_RESTRICT s11) {
+    int8x16_t qx0[16];
+    int8x16_t qx1[16];
+    ggml_tq1_decode_block(x0, qx0);
+    ggml_tq1_decode_block(x1, qx1);
+
+    int32x4_t acc00 = vdupq_n_s32(0);
+    int32x4_t acc01 = vdupq_n_s32(0);
+    int32x4_t acc10 = vdupq_n_s32(0);
+    int32x4_t acc11 = vdupq_n_s32(0);
+
+    for (int c = 0; c < 16; ++c) {
+        const int8x16_t y0v = vld1q_s8(y0->qs + c*16);
+        const int8x16_t y1v = vld1q_s8(y1->qs + c*16);
+
+        acc00 = vdotq_s32(acc00, qx0[c], y0v);
+        acc01 = vdotq_s32(acc01, qx0[c], y1v);
+        acc10 = vdotq_s32(acc10, qx1[c], y0v);
+        acc11 = vdotq_s32(acc11, qx1[c], y1v);
+    }
+
+    *s00 = vaddvq_s32(acc00);
+    *s01 = vaddvq_s32(acc01);
+    *s10 = vaddvq_s32(acc10);
+    *s11 = vaddvq_s32(acc11);
+}
+#endif
+
 void ggml_vec_dot_tq1_0_q8_K(int n, float * GGML_RESTRICT s, size_t bs, const void * GGML_RESTRICT vx, size_t bx, const void * GGML_RESTRICT vy, size_t by, int nrc) {
+    const int nb = n / QK_K;
+
+#if defined(__ARM_NEON) && defined(__ARM_FEATURE_DOTPROD)
+    if (nrc == 2) {
+        const block_tq1_0 * GGML_RESTRICT x0 = vx;
+        const block_tq1_0 * GGML_RESTRICT x1 = (const block_tq1_0 *) ((const uint8_t *) vx + bx);
+        const block_q8_K  * GGML_RESTRICT y0 = vy;
+        const block_q8_K  * GGML_RESTRICT y1 = (const block_q8_K *) ((const uint8_t *) vy + by);
+
+        float sum00 = 0.0f;
+        float sum01 = 0.0f;
+        float sum10 = 0.0f;
+        float sum11 = 0.0f;
+
+        for (int i = 0; i < nb; ++i) {
+            int32_t d00;
+            int32_t d01;
+            int32_t d10;
+            int32_t d11;
+            ggml_tq1_dot_2x2(&x0[i], &x1[i], &y0[i], &y1[i], &d00, &d01, &d10, &d11);
+
+            const int32_t b0 = vaddvq_s32(vpaddlq_s16(vaddq_s16(
+                vld1q_s16(y0[i].bsums), vld1q_s16(y0[i].bsums + 8))));
+            const int32_t b1 = vaddvq_s32(vpaddlq_s16(vaddq_s16(
+                vld1q_s16(y1[i].bsums), vld1q_s16(y1[i].bsums + 8))));
+
+            const float dx0 = GGML_CPU_FP16_TO_FP32(x0[i].d);
+            const float dx1 = GGML_CPU_FP16_TO_FP32(x1[i].d);
+            const float dy0 = y0[i].d;
+            const float dy1 = y1[i].d;
+
+            sum00 += dx0 * dy0 * (float) (d00 - b0);
+            sum01 += dx0 * dy1 * (float) (d01 - b1);
+            sum10 += dx1 * dy0 * (float) (d10 - b0);
+            sum11 += dx1 * dy1 * (float) (d11 - b1);
+        }
+
+        s[0]      = sum00;
+        s[1]      = sum10;
+        s[bs]     = sum01;
+        s[bs + 1] = sum11;
+        return;
+    }
+#endif
+
+    if (nrc == 2) {
+        ggml_vec_dot_tq1_0_q8_K(n, &s[0],     bs, vx,              bx, vy,              by, 1);
+        ggml_vec_dot_tq1_0_q8_K(n, &s[1],     bs, (const uint8_t *) vx + bx, 0, vy,    by, 1);
+        ggml_vec_dot_tq1_0_q8_K(n, &s[bs],    bs, vx,              bx, (const uint8_t *) vy + by, 0, 1);
+        ggml_vec_dot_tq1_0_q8_K(n, &s[bs + 1], bs, (const uint8_t *) vx + bx, 0, (const uint8_t *) vy + by, 0, 1);
+        return;
+    }
+
     assert(nrc == 1);
     UNUSED(nrc);
     UNUSED(bx);
@@ -1689,8 +1820,6 @@ void ggml_vec_dot_tq1_0_q8_K(int n, float * GGML_RESTRICT s, size_t bs, const vo
 
     const block_tq1_0 * GGML_RESTRICT x = vx;
     const block_q8_K  * GGML_RESTRICT y = vy;
-
-    const int nb = n / QK_K;
 
 #if defined(__ARM_NEON)
     float sumf = 0.0f;
@@ -1857,7 +1986,127 @@ void ggml_vec_dot_tq1_0_q8_K(int n, float * GGML_RESTRICT s, size_t bs, const vo
 #endif
 }
 
+#if defined(__ARM_NEON) && defined(__ARM_FEATURE_DOTPROD)
+#define GGML_TQ2_2X2_LOAD4(px, q0, q1, q2, q3) \
+    do { \
+        const uint8x16_t v = vld1q_u8(px); \
+        q0 = vreinterpretq_s8_u8(vandq_u8(v, m3)); \
+        q1 = vreinterpretq_s8_u8(vandq_u8(vshrq_n_u8(v, 2), m3)); \
+        q2 = vreinterpretq_s8_u8(vandq_u8(vshrq_n_u8(v, 4), m3)); \
+        q3 = vreinterpretq_s8_u8(vandq_u8(vshrq_n_u8(v, 6), m3)); \
+    } while (0)
+
+#define GGML_TQ2_2X2_DOT4(acc, x0, x1, x2, x3, y0, y1, y2, y3) \
+    do { \
+        acc = vdotq_s32(acc, x0, y0); \
+        acc = vdotq_s32(acc, x1, y1); \
+        acc = vdotq_s32(acc, x2, y2); \
+        acc = vdotq_s32(acc, x3, y3); \
+    } while (0)
+
+static inline void ggml_tq2_dot_2x2(
+        const uint8_t * GGML_RESTRICT qx0,
+        const uint8_t * GGML_RESTRICT qx1,
+        const int8_t  * GGML_RESTRICT qy0,
+        const int8_t  * GGML_RESTRICT qy1,
+        int32_t * GGML_RESTRICT s00,
+        int32_t * GGML_RESTRICT s01,
+        int32_t * GGML_RESTRICT s10,
+        int32_t * GGML_RESTRICT s11) {
+    int32x4_t acc00 = vdupq_n_s32(0);
+    int32x4_t acc01 = vdupq_n_s32(0);
+    int32x4_t acc10 = vdupq_n_s32(0);
+    int32x4_t acc11 = vdupq_n_s32(0);
+    const uint8x16_t m3 = vdupq_n_u8(3);
+
+    for (int j = 0; j < 64; j += 32) {
+        for (int h = 0; h < 2; ++h) {
+            const int off = j*4 + h*16;
+
+            const int8x16_t y00 = vld1q_s8(qy0 + off +  0);
+            const int8x16_t y01 = vld1q_s8(qy0 + off + 32);
+            const int8x16_t y02 = vld1q_s8(qy0 + off + 64);
+            const int8x16_t y03 = vld1q_s8(qy0 + off + 96);
+            const int8x16_t y10 = vld1q_s8(qy1 + off +  0);
+            const int8x16_t y11 = vld1q_s8(qy1 + off + 32);
+            const int8x16_t y12 = vld1q_s8(qy1 + off + 64);
+            const int8x16_t y13 = vld1q_s8(qy1 + off + 96);
+
+            int8x16_t x00, x01, x02, x03;
+            int8x16_t x10, x11, x12, x13;
+            GGML_TQ2_2X2_LOAD4(qx0 + j + h*16, x00, x01, x02, x03);
+            GGML_TQ2_2X2_LOAD4(qx1 + j + h*16, x10, x11, x12, x13);
+
+            GGML_TQ2_2X2_DOT4(acc00, x00, x01, x02, x03, y00, y01, y02, y03);
+            GGML_TQ2_2X2_DOT4(acc01, x00, x01, x02, x03, y10, y11, y12, y13);
+            GGML_TQ2_2X2_DOT4(acc10, x10, x11, x12, x13, y00, y01, y02, y03);
+            GGML_TQ2_2X2_DOT4(acc11, x10, x11, x12, x13, y10, y11, y12, y13);
+        }
+    }
+
+    *s00 = vaddvq_s32(acc00);
+    *s01 = vaddvq_s32(acc01);
+    *s10 = vaddvq_s32(acc10);
+    *s11 = vaddvq_s32(acc11);
+}
+#undef GGML_TQ2_2X2_LOAD4
+#undef GGML_TQ2_2X2_DOT4
+#endif
+
 void ggml_vec_dot_tq2_0_q8_K(int n, float * GGML_RESTRICT s, size_t bs, const void * GGML_RESTRICT vx, size_t bx, const void * GGML_RESTRICT vy, size_t by, int nrc) {
+    const int nb = n / QK_K;
+
+#if defined(__ARM_NEON) && defined(__ARM_FEATURE_DOTPROD)
+    if (nrc == 2) {
+        const block_tq2_0 * GGML_RESTRICT x0 = vx;
+        const block_tq2_0 * GGML_RESTRICT x1 = (const block_tq2_0 *) ((const uint8_t *) vx + bx);
+        const block_q8_K  * GGML_RESTRICT y0 = vy;
+        const block_q8_K  * GGML_RESTRICT y1 = (const block_q8_K *) ((const uint8_t *) vy + by);
+
+        float sum00 = 0.0f;
+        float sum01 = 0.0f;
+        float sum10 = 0.0f;
+        float sum11 = 0.0f;
+
+        for (int i = 0; i < nb; ++i) {
+            int32_t d00;
+            int32_t d01;
+            int32_t d10;
+            int32_t d11;
+            ggml_tq2_dot_2x2(x0[i].qs, x1[i].qs, y0[i].qs, y1[i].qs, &d00, &d01, &d10, &d11);
+
+            const int32_t b0 = vaddvq_s32(vpaddlq_s16(vaddq_s16(
+                vld1q_s16(y0[i].bsums), vld1q_s16(y0[i].bsums + 8))));
+            const int32_t b1 = vaddvq_s32(vpaddlq_s16(vaddq_s16(
+                vld1q_s16(y1[i].bsums), vld1q_s16(y1[i].bsums + 8))));
+
+            const float dx0 = GGML_CPU_FP16_TO_FP32(x0[i].d);
+            const float dx1 = GGML_CPU_FP16_TO_FP32(x1[i].d);
+            const float dy0 = y0[i].d;
+            const float dy1 = y1[i].d;
+
+            sum00 += dx0 * dy0 * (float) (d00 - b0);
+            sum01 += dx0 * dy1 * (float) (d01 - b1);
+            sum10 += dx1 * dy0 * (float) (d10 - b0);
+            sum11 += dx1 * dy1 * (float) (d11 - b1);
+        }
+
+        s[0]     = sum00;
+        s[1]     = sum10;
+        s[bs]    = sum01;
+        s[bs + 1] = sum11;
+        return;
+    }
+#endif
+
+    if (nrc == 2) {
+        ggml_vec_dot_tq2_0_q8_K(n, &s[0],     bs, vx,              bx, vy,              by, 1);
+        ggml_vec_dot_tq2_0_q8_K(n, &s[1],     bs, (const uint8_t *) vx + bx, 0, vy,    by, 1);
+        ggml_vec_dot_tq2_0_q8_K(n, &s[bs],    bs, vx,              bx, (const uint8_t *) vy + by, 0, 1);
+        ggml_vec_dot_tq2_0_q8_K(n, &s[bs + 1], bs, (const uint8_t *) vx + bx, 0, (const uint8_t *) vy + by, 0, 1);
+        return;
+    }
+
     assert(nrc == 1);
     UNUSED(nrc);
     UNUSED(bx);
@@ -1866,8 +2115,6 @@ void ggml_vec_dot_tq2_0_q8_K(int n, float * GGML_RESTRICT s, size_t bs, const vo
 
     const block_tq2_0 * GGML_RESTRICT x = vx;
     const block_q8_K  * GGML_RESTRICT y = vy;
-
-    const int nb = n / QK_K;
 
 #if defined(__ARM_NEON)
     float sumf = 0.0f;

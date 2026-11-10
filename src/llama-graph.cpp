@@ -2662,6 +2662,12 @@ ggml_tensor * llm_graph_context::build_attn_mha(
     // split the batch into streams if needed
     const auto n_stream = k->ne[3];
 
+    // block-quantized V caches (TQ1/TQ2) cannot be transposed as raw blocks.
+    // dequantize the V view to F32 before the layout transform below.
+    if (ggml_is_quantized(v->type)) {
+        v = ggml_cast(ctx0, v, GGML_TYPE_F32);
+    }
+
     q = ggml_view_4d(ctx0, q, q->ne[0], q->ne[1], q->ne[2]/n_stream, n_stream, q->nb[1], q->nb[2], q->nb[3]/n_stream, 0);
 
     q = ggml_permute(ctx0, q, 0, 2, 1, 3);
